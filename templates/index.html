@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dyslexia Eye-Tracking Dashboard</title>
+<script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--tx:#1c2430;--mut:#667085;--ac:#3b5bdb;--bad:#d9480f;--ok:#2f9e44;--wn:#f08c00;--bd:#e3e6ec}
+@media(prefers-color-scheme:dark){:root{--bg:#12161c;--card:#1b212b;--tx:#e8ecf3;--mut:#9aa4b5;--bd:#2b3340}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--tx)}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px}
+h1{margin:0 0 4px}h2{margin:0 0 10px;font-size:18px}.mut{color:var(--mut);font-size:14px}
+button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer}button:disabled{opacity:.5}
+input{padding:8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);width:100%}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.hide{display:none}
+#text{font-size:28px;line-height:2.3;max-width:900px;margin:90px auto 20px;font-family:Georgia,serif;user-select:none}
+.w{padding:0 2px}.dot{position:fixed;width:28px;height:28px;border-radius:50%;background:#e03131;border:3px solid #fff;transform:translate(-50%,-50%);cursor:pointer;color:#fff;font-size:12px;line-height:22px;text-align:center}
+#stage{position:fixed;inset:0;background:var(--bg);z-index:5}#stage .msg{position:absolute;top:16px;left:0;right:0;text-align:center}
+.badge{display:inline-block;padding:6px 14px;border-radius:20px;color:#fff;font-weight:600}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left}
+.kpi{border:1px solid var(--bd);border-radius:10px;padding:12px}.kpi b{font-size:22px}
+</style></head><body>
+<div class="wrap">
+ <div id="intro" class="card">
+  <h1>Eye-Tracking Dyslexia Screening</h1>
+  <p class="mut">You will calibrate the webcam (≈1 min), then silently read 3 short passages. Gaze is analysed locally on this server; no video is stored.
+  <b>Research screening only — not a clinical diagnosis.</b></p>
+  <div class="row">
+   <label>Name / ID<input id="name" value="Participant"></label>
+   <label>Screen width (cm)<input id="scm" type="number" value="34"></label>
+   <label>Distance to screen (cm)<input id="dist" type="number" value="60"></label></div>
+  <p class="mut">Tips: face a light source, keep your head still and ~60 cm from the screen, use a laptop/desktop with a webcam, close other tabs.</p>
+  <button id="go">Start camera &amp; calibration</button>
+ </div>
+ <div id="wait" class="card hide"><h2>Analysing gaze data…</h2><p class="mut">Detecting fixations, computing indices and SHAP explanations.</p></div>
+ <div id="report" class="hide"></div>
+</div>
+<div id="stage" class="hide"><div class="msg" id="msg"></div><div id="dots"></div>
+ <div id="reading" class="hide"><div id="text"></div><div style="text-align:center"><button id="done" disabled>I have finished reading</button></div></div></div>
+<script>
+const TASKS=[
+ {name:"Passage 1",text:"The old lighthouse stood at the edge of the cliff, watching ships pass through the grey morning mist. Every evening the keeper climbed the narrow stairs to light the lamp, and every morning he wrote the weather in a worn leather book."},
+ {name:"Passage 2",text:"Children in the village waited eagerly for the market day. Farmers brought fresh bread, sweet apples and bright flowers, while musicians played near the fountain and everyone stopped to talk with their neighbours."},
+ {name:"Passage 3 (pseudo-text)",text:"Dro menal bu fesor kelmid tarunep olis vante, bru senop kalidu rem tovan. Gilpo narem su dovite fanol kebrin, tosa mired pul vanek orlit ba sumpel wotaru."}];
+const $=id=>document.getElementById(id);let rec=false,samples=[],val=null,t0=0,out=[],cfg={};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+$('go').onclick=async()=>{
+  cfg={name:$('name').value||'Participant',scm:+$('scm').value,dist:+$('dist').value};
+  $('intro').classList.add('hide');$('stage').classList.remove('hide');$('msg').textContent='Starting camera… allow access when asked.';
+  try{
+    webgazer.params.faceMeshSolutionPath='https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
+    webgazer.saveDataAcrossSessions(false);
+    await webgazer.setRegression('ridge').setGazeListener((d,t)=>{if(!d)return;
+      if(rec)samples.push({t:Math.round(t-t0),x:d.x,y:d.y});if(val)val.push([d.x,d.y]);}).begin();
+    webgazer.showVideoPreview(true).showPredictionPoints(true);
+  }catch(e){alert('Could not start webcam tracking: '+e);location.reload();return}
+  await calibrate();await validate();
+  webgazer.showVideoPreview(false).showPredictionPoints(false);
+  for(const t of TASKS)await readTask(t);
+  $('stage').classList.add('hide');webgazer.pause();submit();
+};
+async function calibrate(){
+  const pts=[[10,12],[50,12],[90,12],[10,50],[50,50],[90,50],[10,88],[50,88],[90,88]];
+  $('msg').innerHTML='<b>Calibration:</b> look at each red dot and click it 5 times.';
+  for(const [px,py] of pts){await new Promise(res=>{
+    const d=document.createElement('div');d.className='dot';d.style.left=px+'%';d.style.top=py+'%';let n=0;d.textContent=5;
+    d.onclick=()=>{n++;d.textContent=5-n;d.style.opacity=.3+.14*n;if(n>=5){d.remove();res()}};$('dots').appendChild(d);});}
+}
+async function validate(){
+  $('msg').innerHTML='<b>Accuracy check:</b> stare at the dot for 3 seconds.';
+  const d=document.createElement('div');d.className='dot';d.style.left='50%';d.style.top='50%';d.style.background='#1971c2';$('dots').appendChild(d);
+  await sleep(1000);val=[];await sleep(3000);const v=val;val=null;d.remove();
+  const cx=innerWidth/2,cy=innerHeight/2;
+  const err=v.length?v.reduce((s,p)=>s+Math.hypot(p[0]-cx,p[1]-cy),0)/v.length:9999;
+  if(err>250&&confirm(`Mean error is ${Math.round(err)} px (high). Recalibrate?`)){$('dots').innerHTML='';await calibrate();return validate();}
+  cfg.calib_err=Math.round(err);
+}
+async function readTask(t){
+  $('msg').textContent=t.name+' — read silently at your natural pace, then click the button.';
+  $('reading').classList.remove('hide');const box=$('text');box.innerHTML='';
+  t.text.split(' ').forEach((w,i)=>{const s=document.createElement('span');s.className='w';s.dataset.i=i;s.textContent=w+' ';box.appendChild(s)});
+  await sleep(600);
+  const spans=[...box.children];let line=-1,lastTop=-1e9;
+  const words=spans.map((s,i)=>{const r=s.getBoundingClientRect();if(Math.abs(r.top-lastTop)>10){line++;lastTop=r.top}
+    return{i,line,x:r.left,y:r.top,w:r.width,h:r.height,text:s.textContent.trim()}});
+  samples=[];t0=performance.now();rec=true;const start=t0;$('done').disabled=true;setTimeout(()=>$('done').disabled=false,4000);
+  await new Promise(res=>$('done').onclick=res);rec=false;
+  out.push({name:t.name,duration_ms:Math.round(performance.now()-start),gaze:samples,words});
+  $('reading').classList.add('hide');
+}
+async function submit(){
+  $('wait').classList.remove('hide');
+  const body={name:cfg.name,distance_cm:cfg.dist,px_per_cm:screen.width/cfg.scm,calib_err:cfg.calib_err,tasks:out};
+  const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();$('wait').classList.add('hide');if(j.error){alert(j.error);location.reload();return}render(j);
+}
+function render(r){
+  const V={dyslexic:['Dyslexia-like reading pattern detected','var(--bad)'],non_dyslexic:['No dyslexia-like pattern detected','var(--ok)'],inconclusive:['Inconclusive — poor data quality','var(--wn)']}[r.status];
+  const f=v=>v==null?'–':v;const idx=Object.entries(r.indices);
+  const top=r.top_toward[0];
+  const why=r.status==='inconclusive'?r.warnings.join(' '):
+    (r.top_toward.length?`<b>${r.top_toward.map(i=>i.label).join(', ')}</b> contributed most toward the dyslexia class`:'No parameter pushed toward the dyslexia class')+
+    (r.top_away.length?`, while <b>${r.top_away.map(i=>i.label).join(', ')}</b> pointed toward a typical pattern.`:'.');
+  $('report').innerHTML=`
+  <div class="card"><h1>Report: ${cfg.name}</h1><span class="badge" style="background:${V[1]}">${V[0]}</span>
+   ${r.confidence==='borderline'&&r.status!=='inconclusive'?'<span class="badge" style="background:var(--wn);margin-left:8px">Borderline</span>':''}
+   <p>Model probability of dyslexia: <b>${(r.probability*100).toFixed(1)}%</b></p><p>${why}</p>
+   <p class="mut">Data quality: ${r.quality.sampling_hz} Hz · ${r.quality.fixations} fixations · ${(r.quality.word_coverage*100).toFixed(0)}% on text · calibration error ${cfg.calib_err}px.
+   Research screening only; webcam data are noisier than the tracker data used for training. Not a clinical diagnosis.</p>
+   <a href="/api/report/${r.id}.pdf"><button>Download PDF report</button></a></div>
+  <div class="card"><h2>Research indices</h2><div class="row">${idx.map(([k,v])=>`<div class="kpi"><div class="mut">${k}</div><b>${f(v.value)}</b>
+   <div class="mut">Non-dyslexic median ${f(v.control)} · Dyslexic ${f(v.dyslexic)}</div>
+   <div style="color:${v.shap>0?'var(--bad)':'var(--ok)'}">${v.shap>0?'▲ toward dyslexia':'▼ toward typical'} (${v.shap>0?'+':''}${v.shap})</div></div>`).join('')}</div></div>
+  <div class="card"><h2>Explainable AI: which parameters drive the result</h2>
+   <p class="mut">TreeSHAP values in log-odds: red pushes toward dyslexia, green toward typical reading.</p>
+   <canvas id="ch" height="150"></canvas><h2 style="margin-top:18px">By category</h2><canvas id="ch2" height="70"></canvas></div>
+  <div class="card"><h2>Key parameters vs. reference cohort</h2><table><tr><th>Parameter</th><th>You</th><th>Non-dyslexic median</th><th>Dyslexic median</th><th>SHAP</th></tr>
+   ${r.contributions.slice(0,14).map(i=>`<tr><td>${i.label}</td><td>${f(i.value)}</td><td>${f(i.control)}</td><td>${f(i.dyslexic)}</td>
+   <td style="color:${i.shap>0?'var(--bad)':'var(--ok)'}">${i.shap>0?'+':''}${i.shap}</td></tr>`).join('')}</table></div>
+  <div class="card"><h2>Gaze paths</h2>${out.map((t,i)=>`<button onclick="path(${i})" style="margin-right:6px">${t.name}</button>`).join('')}
+   <canvas id="gp" style="width:100%;margin-top:10px;border:1px solid var(--bd);border-radius:8px"></canvas></div>`;
+  $('report').classList.remove('hide');window.R=r;scrollTo(0,0);
+  const c=r.contributions.slice(0,12);
+  new Chart($('ch'),{type:'bar',data:{labels:c.map(i=>i.label),datasets:[{data:c.map(i=>i.shap),backgroundColor:c.map(i=>i.shap>0?'#d9480f':'#2f9e44')}]},options:{indexAxis:'y',plugins:{legend:{display:false}}}});
+  const ck=Object.entries(r.categories);
+  new Chart($('ch2'),{type:'bar',data:{labels:ck.map(k=>k[0]),datasets:[{data:ck.map(k=>k[1]),backgroundColor:ck.map(k=>k[1]>0?'#d9480f':'#2f9e44')}]},options:{indexAxis:'y',plugins:{legend:{display:false}}}});
+  path(0);
+}
+function path(i){
+  const cv=$('gp'),s=0.6;cv.width=innerWidth*s;cv.height=innerHeight*s;const g=cv.getContext('2d');g.scale(s,s);
+  g.fillStyle='#888';g.font='16px Georgia';out[i].words.forEach(w=>{g.strokeStyle='#ccc';g.strokeRect(w.x,w.y,w.w,w.h);g.fillText(w.text,w.x,w.y+w.h*0.7)});
+  const fx=R.fixations[i];g.strokeStyle='rgba(59,91,219,.6)';g.lineWidth=1.5;g.beginPath();fx.forEach((p,k)=>k?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y));g.stroke();
+  fx.forEach((p,k)=>{g.beginPath();g.fillStyle='rgba(224,49,49,.45)';g.arc(p.x,p.y,Math.max(4,p.dur/12),0,7);g.fill();g.fillStyle='#000';g.font='11px sans-serif';g.fillText(k+1,p.x-3,p.y+4)});
+}
+</script></body></html>
